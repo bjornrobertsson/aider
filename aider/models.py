@@ -1012,6 +1012,23 @@ class Model(ModelSettings):
         if self.is_ollama() and "num_ctx" not in kwargs:
             num_ctx = int(self.token_count(messages) * 1.25) + 8192
             kwargs["num_ctx"] = num_ctx
+
+        # Agentic context guard: clamp max_tokens dynamically so input + output never exceeds model limit
+        max_context = self.info.get("max_input_tokens") or self.info.get("max_tokens") or 0
+        if max_context and "max_tokens" in kwargs:
+            input_tokens = self.token_count(messages)
+            safety_margin = 150
+            available_output = max_context - input_tokens - safety_margin
+            req_output = kwargs["max_tokens"]
+            if available_output < req_output:
+                safe_output = max(64, available_output)
+                kwargs["max_tokens"] = safe_output
+                if self.verbose or safe_output < req_output:
+                    print(
+                        f"\n⚡ [Context Guard] Dynamically clamped max_tokens from {req_output} to {safe_output} "
+                        f"(input: {input_tokens:,}, context limit: {max_context:,})"
+                    )
+
         key = json.dumps(kwargs, sort_keys=True).encode()
 
         # dump(kwargs)

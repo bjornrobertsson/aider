@@ -110,4 +110,18 @@ class LiteLLMExceptions:
                 )
             # Fall through to default APIError handling if not the specific credits error
 
+        # Map vLLM / OpenAI-compatible context window errors
+        err_str = str(ex).lower()
+        if (
+            "maximum context length is" in err_str
+            or "context_length_exceeded" in err_str
+            or "too many tokens" in err_str
+            or "prompt is too long" in err_str
+        ):
+            return ExInfo(
+                "ContextWindowExceededError",
+                False,
+                "Context limit exceeded on LLM server.",
+            )
+
         return self.exceptions.get(ex.__class__, ExInfo(None, None, None))

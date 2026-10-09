@@ -1393,6 +1393,73 @@ class Coder:
 
         return chunks
 
+    def auto_recover_context(self, inp):
+        """Agentic self-healing context guard: automatically compresses history and drops unneeded files
+        to keep total prompt tokens comfortably within the model's context window.
+        """
+        max_input = self.main_model.info.get("max_input_tokens") or self.main_model.info.get("max_tokens") or 0
+        if not max_input:
+            return
+
+        req_output = 4096
+        if self.main_model.extra_params and "max_tokens" in self.main_model.extra_params:
+            req_output = self.main_model.extra_params["max_tokens"]
+
+        reserved_headroom = max(4096, req_output + 500)
+        safe_budget = max_input - reserved_headroom
+
+        chunks = self.format_messages()
+        curr_tokens = self.main_model.token_count(chunks.all_messages())
+        if curr_tokens <= safe_budget:
+            return
+
+        # Step 1: Compress conversation history if messages exist
+        if self.done_messages and len(self.done_messages) > 2:
+            self.io.tool_output(
+                f"\n⚡ [Context Guard] Context pressure high ({curr_tokens:,}/{max_input:,} tokens). Auto-compressing chat history..."
+            )
+            try:
+                self.done_messages = self.summarizer.summarize_all(self.done_messages)
+                chunks = self.format_messages()
+                curr_tokens = self.main_model.token_count(chunks.all_messages())
+            except Exception as e:
+                self.io.tool_warning(f"[Context Guard] History compression error: {e}")
+
+        if curr_tokens <= safe_budget:
+            self.io.tool_output(f"⚡ [Context Guard] Context restored to {curr_tokens:,} tokens.")
+            return
+
+        # Step 2: Auto-evict files from active editable set that are not referenced in user input
+        if self.abs_fnames and len(self.abs_fnames) > 1:
+            inp_lower = (inp or "").lower()
+
+            unreferenced_files = []
+            for fname in list(self.abs_fnames):
+                base = os.path.basename(fname).lower()
+                rel = self.get_rel_fname(fname).lower()
+                if base not in inp_lower and rel not in inp_lower:
+                    try:
+                        size = os.path.getsize(fname)
+                    except OSError:
+                        size = 0
+                    unreferenced_files.append((size, fname))
+
+            unreferenced_files.sort(key=lambda x: x[0], reverse=True)
+
+            for size, fname in unreferenced_files:
+                if len(self.abs_fnames) <= 1:
+                    break
+                rel = self.get_rel_fname(fname)
+                self.abs_fnames.remove(fname)
+                self.io.tool_output(
+                    f"⚡ [Context Guard] Auto-dropped '{rel}' (~{size // 4:,} tokens) from editable context to prevent overflow."
+                )
+                chunks = self.format_messages()
+                curr_tokens = self.main_model.token_count(chunks.all_messages())
+                if curr_tokens <= safe_budget:
+                    self.io.tool_output(f"⚡ [Context Guard] Context restored to {curr_tokens:,} tokens.")
+                    break
+
     def check_tokens(self, messages):
         """Check if the messages will fit within the model's token limits."""
         input_tokens = self.main_model.token_count(messages)
@@ -1425,6 +1492,8 @@ class Coder:
         self.cur_messages += [
             dict(role="user", content=inp),
         ]
+
+        self.auto_recover_context(inp)
 
         chunks = self.format_messages()
         messages = chunks.all_messages()
