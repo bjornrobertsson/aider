@@ -795,7 +795,22 @@ class InputOutput:
         self.append_chat_history(hist)
 
     def offer_url(self, url, prompt="Open URL for more info?", allow_never=True):
-        """Offer to open a URL in the browser, returns True if opened."""
+        """Offer to open a URL in the browser, returns True if opened.
+
+        Pre-conditions:
+            - url is a string containing a target URL.
+            - prompt is a question prompt string.
+            - allow_never is a boolean indicating whether user can select 'never'.
+
+        Post-conditions:
+            - Returns False if browser opening is suppressed or user declines.
+            - Returns True if user confirms and browser is launched.
+
+        Raises:
+            - None.
+        """
+        if os.environ.get("AIDER_NO_BROWSER_HELP") or os.environ.get("AIDER_NO_BROWSER"):
+            return False
         if url in self.never_prompts:
             return False
         if self.confirm_ask(prompt, subject=url, allow_never=allow_never):

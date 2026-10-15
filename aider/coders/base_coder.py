@@ -944,7 +944,23 @@ class Coder:
             message = self.reflected_message
 
     def check_and_open_urls(self, exc, friendly_msg=None):
-        """Check exception for URLs, offer to open in a browser, with user-friendly error msgs."""
+        """Check exception for URLs, offer to open in a browser, with user-friendly error msgs.
+
+        Pre-conditions:
+            - exc is an Exception instance or string describing an error.
+            - friendly_msg is an optional string providing additional user guidance.
+
+        Post-conditions:
+            - Formats error messages to user output.
+            - Filters out API endpoints, internal cluster IPs, localhost, and non-documentation URLs.
+            - Offers remaining valid documentation URLs to the user unless suppressed.
+            - Returns list of URLs offered.
+
+        Raises:
+            - None.
+        """
+        import urllib.parse
+
         text = str(exc)
 
         if friendly_msg:
@@ -953,13 +969,37 @@ class Coder:
         else:
             self.io.tool_error(text)
 
+        if os.environ.get("AIDER_NO_BROWSER_HELP") or os.environ.get("AIDER_NO_BROWSER"):
+            return []
+
         # Exclude double quotes from the matched URL characters
         url_pattern = re.compile(r'(https?://[^\s/$.?#].[^\s"]*)')
         urls = list(set(url_pattern.findall(text)))  # Use set to remove duplicates
+        offered = []
         for url in urls:
             url = url.rstrip(".',\"}")  # Added } to the characters to strip
+            try:
+                parsed = urllib.parse.urlparse(url)
+                host = (parsed.hostname or "").lower()
+                # Skip internal cluster IPs, localhost, and API endpoints
+                if (
+                    host in ("localhost", "127.0.0.1", "0.0.0.0")
+                    or host.endswith(".local")
+                    or host.endswith(".internal")
+                    or host.startswith("192.168.")
+                    or host.startswith("10.")
+                    or (host.startswith("172.") and len(host.split(".")) > 1 and 16 <= int(host.split(".")[1]) <= 31)
+                    or "/chat/completions" in parsed.path
+                    or "/v1" in parsed.path
+                    or parsed.port in (8000, 8080, 11434, 5000)
+                ):
+                    continue
+            except Exception:
+                continue
+
             self.io.offer_url(url)
-        return urls
+            offered.append(url)
+        return offered
 
     def check_for_urls(self, inp: str) -> List[str]:
         """Check input for URLs and offer to add them to the chat."""
@@ -1484,6 +1524,19 @@ class Coder:
         return True
 
     def send_message(self, inp):
+        """Format messages and stream assistant completion responses with retry handling.
+
+        Pre-conditions:
+            - inp is a string representing the user prompt or empty for continuation.
+
+        Post-conditions:
+            - Yields assistant response content chunks from the LLM.
+            - Updates chat history and token usage metrics.
+            - Automatically handles server startup retries and stops spinner upon completion or failure.
+
+        Raises:
+            - None (catches and formats recoverable exceptions to user output).
+        """
         self.event("message_send_starting")
 
         # Notify IO that LLM processing is starting
@@ -1505,57 +1558,95 @@ class Coder:
             utils.show_messages(messages, functions=self.functions)
 
         self.multi_response_content = ""
-        if self.show_pretty():
-            self.waiting_spinner = WaitingSpinner("Waiting for " + self.main_model.name)
-            self.waiting_spinner.start()
-            if self.stream:
-                self.mdstream = self.io.get_assistant_mdstream()
-            else:
-                self.mdstream = None
-        else:
-            self.mdstream = None
-
-        retry_delay = 0.125
-
-        litellm_ex = LiteLLMExceptions()
-
         self.usage_report = None
         exhausted = False
         interrupted = False
+
+        retry_delay = 1.0
+        retry_count = 0
+        start_retry_time = None
+
         try:
+            litellm_ex = LiteLLMExceptions()
             while True:
+                if self.show_pretty() and not getattr(self, "waiting_spinner", None):
+                    self.waiting_spinner = WaitingSpinner("Waiting for " + self.main_model.name)
+                    self.waiting_spinner.start()
+                    if self.stream:
+                        self.mdstream = self.io.get_assistant_mdstream()
+                    else:
+                        self.mdstream = None
+                elif not self.stream:
+                    self.mdstream = None
+
                 try:
                     yield from self.send(messages, functions=self.functions)
                     break
                 except litellm_ex.exceptions_tuple() as err:
+                    self._stop_waiting_spinner()
                     ex_info = litellm_ex.get_ex_info(err)
 
                     if ex_info.name == "ContextWindowExceededError":
                         exhausted = True
                         break
 
-                    should_retry = ex_info.retry
-                    if should_retry:
-                        retry_delay *= 2
-                        if retry_delay > RETRY_TIMEOUT:
-                            should_retry = False
+                    err_str = str(err).lower()
+                    is_server_startup = (
+                        ex_info.name in (
+                            "APIConnectionError", "ServiceUnavailableError",
+                            "InternalServerError", "Timeout", "BadGatewayError",
+                            "ConnectError", "ConnectTimeout", "ReadTimeout"
+                        )
+                        or any(phrase in err_str for phrase in (
+                            "502 bad gateway", "bad gateway", "503 service unavailable",
+                            "service unavailable", "connection refused", "connecterror",
+                            "failed to connect", "server disconnected", "cannot connect to host"
+                        ))
+                    )
+
+                    if is_server_startup:
+                        timeout = int(os.environ.get("AIDER_CONNECT_TIMEOUT", os.environ.get("AIDER_RETRY_TIMEOUT", 600)))
+                    else:
+                        timeout = int(os.environ.get("AIDER_RETRY_TIMEOUT", RETRY_TIMEOUT))
+
+                    if start_retry_time is None:
+                        start_retry_time = time.time()
+
+                    elapsed = time.time() - start_retry_time
+                    should_retry = ex_info.retry and (elapsed + retry_delay <= timeout)
 
                     if not should_retry:
                         self.mdstream = None
-                        self.check_and_open_urls(err, ex_info.description)
+                        if is_server_startup:
+                            self.io.tool_error(
+                                f"Model server at {self.main_model.name} did not become ready after {int(elapsed)} seconds."
+                            )
+                        else:
+                            self.check_and_open_urls(err, ex_info.description)
                         break
 
-                    err_msg = str(err)
-                    if ex_info.description:
-                        self.io.tool_warning(err_msg)
-                        self.io.tool_error(ex_info.description)
-                    else:
-                        self.io.tool_error(err_msg)
+                    if retry_count == 0:
+                        err_msg = str(err)
+                        if ex_info.description:
+                            self.io.tool_warning(err_msg)
+                            self.io.tool_error(ex_info.description)
+                        else:
+                            self.io.tool_error(err_msg)
 
-                    self.io.tool_output(f"Retrying in {retry_delay:.1f} seconds...")
+                    retry_delay = min(10.0, max(1.0, retry_delay * 1.5))
+                    if is_server_startup:
+                        self.io.tool_output(
+                            f"Waiting for model server at {self.main_model.name} to become ready "
+                            f"(retrying in {retry_delay:.1f}s, elapsed: {int(elapsed)}s / {int(timeout)}s, Ctrl+C to cancel)..."
+                        )
+                    else:
+                        self.io.tool_output(f"Retrying in {retry_delay:.1f} seconds...")
+
                     time.sleep(retry_delay)
+                    retry_count += 1
                     continue
                 except KeyboardInterrupt:
+                    self._stop_waiting_spinner()
                     interrupted = True
                     break
                 except FinishReasonLength:

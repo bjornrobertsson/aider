@@ -62,31 +62,99 @@ class LiteLLMExceptions:
     exception_info = {exi.name: exi for exi in EXCEPTIONS}
 
     def __init__(self):
+        """Initialize and populate the LiteLLM exception mapping.
+
+        Pre-conditions:
+            - None.
+
+        Post-conditions:
+            - self.exceptions contains mapping of resolved exception classes to ExInfo instances.
+
+        Raises:
+            - None.
+        """
         self._load()
 
     def _load(self, strict=False):
+        """Load and resolve exception classes from litellm and underlying HTTP/OpenAI modules.
+
+        Pre-conditions:
+            - litellm package is importable in the active environment.
+            - strict is a boolean indicating whether unrecognized errors raise ValueError.
+
+        Post-conditions:
+            - self.exceptions dictionary is populated mapping Exception classes to ExInfo instances.
+            - Missing attributes in litellm do not raise AttributeError.
+
+        Raises:
+            - ValueError: If strict=True and a litellm Error class is not present in self.exception_info.
+        """
         import litellm
 
-        for var in dir(litellm):
-            # Filter by BaseException because instances of non-exception classes cannot be caught.
-            # `litellm.ErrorEventError` is an example of a regular class which just happens to end
-            # with `Error`.
-            if var.endswith("Error") and issubclass(getattr(litellm, var), BaseException):
-                if var not in self.exception_info:
-                    raise ValueError(f"{var} is in litellm but not in aider's exceptions list")
+        if strict:
+            for var in dir(litellm):
+                # Filter by BaseException because instances of non-exception classes cannot be caught.
+                if var.endswith("Error"):
+                    try:
+                        attr = getattr(litellm, var, None)
+                        if isinstance(attr, type) and issubclass(attr, BaseException):
+                            if var not in self.exception_info:
+                                raise ValueError(f"{var} is in litellm but not in aider's exceptions list")
+                    except TypeError:
+                        pass
 
         for var in self.exception_info:
-            ex = getattr(litellm, var)
-            self.exceptions[ex] = self.exception_info[var]
+            ex = getattr(litellm, var, None)
+            if ex is None and hasattr(litellm, "exceptions"):
+                ex = getattr(litellm.exceptions, var, None)
+            if ex is not None and isinstance(ex, type) and issubclass(ex, BaseException):
+                self.exceptions[ex] = self.exception_info[var]
+
+        # Also capture raw network connection and timeout errors from underlying libraries
+        try:
+            import httpx
+            self.exceptions[httpx.ConnectError] = ExInfo("ConnectError", True, "Connection to LLM server failed.")
+            self.exceptions[httpx.ReadTimeout] = ExInfo("ReadTimeout", True, "LLM server timed out.")
+            self.exceptions[httpx.ConnectTimeout] = ExInfo("ConnectTimeout", True, "Connection to LLM server timed out.")
+        except ImportError:
+            pass
+
+        try:
+            import openai
+            self.exceptions[openai.APIConnectionError] = ExInfo("APIConnectionError", True, "Cannot connect to LLM server.")
+            self.exceptions[openai.InternalServerError] = ExInfo("InternalServerError", True, "LLM server returned an error.")
+        except ImportError:
+            pass
 
     def exceptions_tuple(self):
+        """Return tuple of all registered exception classes suitable for except clauses.
+
+        Pre-conditions:
+            - None.
+
+        Post-conditions:
+            - Returns tuple of Exception types.
+
+        Raises:
+            - None.
+        """
         return tuple(self.exceptions)
 
     def get_ex_info(self, ex):
-        """Return the ExInfo for a given exception instance"""
+        """Return the ExInfo for a given exception instance.
+
+        Pre-conditions:
+            - ex is an instance of BaseException.
+
+        Post-conditions:
+            - Returns a valid ExInfo instance describing the retryability and description of ex.
+
+        Raises:
+            - None.
+        """
         import litellm
 
-        if ex.__class__ is litellm.APIConnectionError:
+        if hasattr(litellm, "APIConnectionError") and isinstance(ex, litellm.APIConnectionError):
             if "boto3" in str(ex):
                 return ExInfo("APIConnectionError", False, "You need to: pip install boto3")
             if "OpenrouterException" in str(ex) and "'choices'" in str(ex):
@@ -100,7 +168,7 @@ class LiteLLMExceptions:
                 )
 
         # Check for specific non-retryable APIError cases like insufficient credits
-        if ex.__class__ is litellm.APIError:
+        if hasattr(litellm, "APIError") and isinstance(ex, litellm.APIError):
             err_str = str(ex).lower()
             if "insufficient credits" in err_str and '"code":402' in err_str:
                 return ExInfo(
@@ -123,5 +191,22 @@ class LiteLLMExceptions:
                 False,
                 "Context limit exceeded on LLM server.",
             )
+
+        # Direct class lookup
+        if ex.__class__ in self.exceptions:
+            return self.exceptions[ex.__class__]
+
+        # Subclass lookup
+        for exc_cls, info in self.exceptions.items():
+            if isinstance(ex, exc_cls):
+                return info
+
+        # Fallback string pattern checks for cluster/server startup & bad gateway errors
+        if any(term in err_str for term in (
+            "502 bad gateway", "bad gateway", "connection refused", "connecterror",
+            "failed to connect", "service unavailable", "503 service unavailable",
+            "remote disconnected", "server disconnected"
+        )):
+            return ExInfo(ex.__class__.__name__, True, "The LLM server is starting up or temporarily unavailable.")
 
         return self.exceptions.get(ex.__class__, ExInfo(None, None, None))

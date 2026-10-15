@@ -35,14 +35,20 @@ def get_git_info():
 
 
 def report_github_issue(issue_text, title=None, confirm=True):
-    """
-    Compose a URL to open a new GitHub issue with the given text prefilled,
-    and attempt to launch it in the default web browser.
+    """Compose a URL to open a new GitHub issue with the given text prefilled.
 
-    :param issue_text: The text of the issue to file
-    :param title: The title of the issue (optional)
-    :param confirm: Whether to ask for confirmation before opening the browser (default: True)
-    :return: None
+    Pre-conditions:
+        - issue_text is a string containing error or issue details.
+        - title is an optional string issue title.
+        - confirm is a boolean indicating whether user confirmation is required.
+
+    Post-conditions:
+        - Displays error summary.
+        - Suppresses browser launch if AIDER_NO_BROWSER_HELP or AIDER_NO_BROWSER is set.
+        - Attempts browser launch only if confirmed and not suppressed.
+
+    Raises:
+        - None.
     """
     version_info = f"Aider version: {__version__}\n"
     python_version = f"Python version: {sys.version.split()[0]}\n"
@@ -61,6 +67,13 @@ def report_github_issue(issue_text, title=None, confirm=True):
         title = "Bug report"
     params["title"] = title
     issue_url = f"{github_issues}?{urllib.parse.urlencode(params)}"
+
+    if os.environ.get("AIDER_NO_BROWSER_HELP") or os.environ.get("AIDER_NO_BROWSER"):
+        print(f"\n# {title}\n")
+        print(issue_text.strip())
+        print()
+        print(f"Issue URL: {issue_url}")
+        return
 
     if confirm:
         print(f"\n# {title}\n")
@@ -92,8 +105,22 @@ def report_github_issue(issue_text, title=None, confirm=True):
 
 
 def exception_handler(exc_type, exc_value, exc_traceback):
-    # If it's a KeyboardInterrupt, just call the default handler
-    if issubclass(exc_type, KeyboardInterrupt):
+    """Global exception handler to report uncaught exceptions.
+
+    Pre-conditions:
+        - exc_type is a BaseException class.
+        - exc_value is an exception instance.
+        - exc_traceback is a traceback object.
+
+    Post-conditions:
+        - Formats and displays uncaught exception report.
+        - Suppresses browser interaction if configured.
+
+    Raises:
+        - None.
+    """
+    # If it's a KeyboardInterrupt or SystemExit, just call the default handler
+    if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
         return sys.__excepthook__(exc_type, exc_value, exc_traceback)
 
     # We don't want any more exceptions

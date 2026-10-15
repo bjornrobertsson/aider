@@ -1054,12 +1054,26 @@ class Model(ModelSettings):
         return hash_object, res
 
     def simple_send_with_retries(self, messages):
+        """Send completion request with resilient retries for transient and startup errors.
+
+        Pre-conditions:
+            - messages is a list of dicts with role and content keys.
+
+        Post-conditions:
+            - Returns generated assistant content string if successful, or None if retries fail.
+
+        Raises:
+            - None.
+        """
         from aider.exceptions import LiteLLMExceptions
 
         litellm_ex = LiteLLMExceptions()
         if "deepseek-reasoner" in self.name:
             messages = ensure_alternating_roles(messages)
-        retry_delay = 0.125
+
+        retry_delay = 1.0
+        retry_count = 0
+        start_retry_time = None
 
         if self.verbose:
             dump(messages)
@@ -1082,19 +1096,55 @@ class Model(ModelSettings):
 
             except litellm_ex.exceptions_tuple() as err:
                 ex_info = litellm_ex.get_ex_info(err)
-                print(str(err))
-                if ex_info.description:
-                    print(ex_info.description)
-                should_retry = ex_info.retry
-                if should_retry:
-                    retry_delay *= 2
-                    if retry_delay > RETRY_TIMEOUT:
-                        should_retry = False
+                err_str = str(err).lower()
+                is_server_startup = (
+                    ex_info.name in (
+                        "APIConnectionError", "ServiceUnavailableError",
+                        "InternalServerError", "Timeout", "BadGatewayError",
+                        "ConnectError", "ConnectTimeout", "ReadTimeout"
+                    )
+                    or any(phrase in err_str for phrase in (
+                        "502 bad gateway", "bad gateway", "503 service unavailable",
+                        "service unavailable", "connection refused", "connecterror",
+                        "failed to connect", "server disconnected", "cannot connect to host"
+                    ))
+                )
+
+                if is_server_startup:
+                    timeout = int(os.environ.get("AIDER_CONNECT_TIMEOUT", os.environ.get("AIDER_RETRY_TIMEOUT", 600)))
+                else:
+                    timeout = int(os.environ.get("AIDER_RETRY_TIMEOUT", RETRY_TIMEOUT))
+
+                if start_retry_time is None:
+                    start_retry_time = time.time()
+
+                elapsed = time.time() - start_retry_time
+                should_retry = ex_info.retry and (elapsed + retry_delay <= timeout)
+
+                if retry_count == 0:
+                    print(str(err))
+                    if ex_info.description:
+                        print(ex_info.description)
+
                 if not should_retry:
+                    if is_server_startup:
+                        print(f"Model server at {self.name} did not become ready after {int(elapsed)} seconds.")
                     return None
-                print(f"Retrying in {retry_delay:.1f} seconds...")
+
+                retry_delay = min(10.0, max(1.0, retry_delay * 1.5))
+                if is_server_startup:
+                    print(
+                        f"Waiting for model server at {self.name} to become ready "
+                        f"(retrying in {retry_delay:.1f}s, elapsed: {int(elapsed)}s / {int(timeout)}s, Ctrl+C to cancel)..."
+                    )
+                else:
+                    print(f"Retrying in {retry_delay:.1f} seconds...")
+
                 time.sleep(retry_delay)
+                retry_count += 1
                 continue
+            except KeyboardInterrupt:
+                return None
             except AttributeError:
                 return None
 
