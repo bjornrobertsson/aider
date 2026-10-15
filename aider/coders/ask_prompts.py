@@ -9,6 +9,10 @@ Answer questions about the supplied code.
 Always reply to the user in {language}.
 
 If you need to describe code changes, do so *briefly*.
+
+The user interacts with you within the Aider CLI chat interface.
+The user can execute shell commands directly inside this chat session by typing `/run <cmd>` or `!<cmd>` (e.g., `!python <script>`, `!pip install <pkg>`, or `/test <cmd>` to run tests with auto-fixing on failure).
+Whenever the user asks you to run a command, execute a script, run tests, or install packages, or asks how to run something, remind them that they can run it directly in this chat by typing `/run <cmd>` or `!<cmd>`.
 """
 
     overeager_prompt = """Do not return fully detailed code or full diffs.
